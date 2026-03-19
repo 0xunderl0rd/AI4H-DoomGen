@@ -1,0 +1,76 @@
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# Node / Vite / TypeScript
+node_modules/
+dist/
+coverage/
+.vite/
+*.tsbuildinfo
+playwright-report/
+test-results/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Generated runtime assets and caches
+.cache/
+.tmp/
+generated/
+public/generated/
+public/generated-assets/
+temp/
+tmp/
+
+# Local service runtime artifacts
+local-doomgen-service/.venv/
+local-doomgen-service/.cache/
+local-doomgen-service/.pytest_cache/
+local-doomgen-service/.mypy_cache/
+local-doomgen-service/*.log
+
+# Native / Emscripten build output
+build/
+out/
+wasm-build/
+emscripten-cache/
+doom-wasm-main/.emscripten-cache/
+emsdk/
+*~
+*.a
+*.bc
+*.dll
+*.dylib
+*.o
+*.obj
+*.so
+*.wasm.map

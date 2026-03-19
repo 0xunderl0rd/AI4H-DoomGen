@@ -1,0 +1,2662 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Doom Runtime</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2305090d'/%3E%3Cpath d='M8 24V8h7.5c5.6 0 8.5 2.8 8.5 8s-2.9 8-8.5 8H8zm5-4h2.2c2.8 0 4.7-1.2 4.7-4s-1.9-4-4.7-4H13v8z' fill='%23fb8f39'/%3E%3C/svg%3E"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #05090d;
+      }
+
+      body {
+        font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+        color: #f0f4f8;
+      }
+
+      #status {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        z-index: 10;
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: rgba(7, 14, 20, 0.82);
+        border: 1px solid rgba(248, 129, 48, 0.4);
+        font-size: 14px;
+      }
+
+      #status.is-hidden {
+        display: none;
+      }
+
+      #canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        background: #000;
+      }
+
+      #weapon-overlay {
+        position: fixed;
+        left: 50%;
+        bottom: 0;
+        z-index: 6;
+        display: none;
+        pointer-events: none;
+        will-change: left, bottom, opacity, transform;
+      }
+
+      #weapon-overlay-image {
+        display: block;
+        max-width: none;
+        transform-origin: center bottom;
+        user-select: none;
+        -webkit-user-drag: none;
+        filter: drop-shadow(0 18px 28px rgba(0, 0, 0, 0.58));
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status">Booting Doom...</div>
+    <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+    <div id="weapon-overlay" aria-hidden="true">
+      <img id="weapon-overlay-image" alt="" />
+    </div>
+
+    <script>
+      const commonArgs = [
+        "-iwad",
+        "doom1.wad",
+        "-window",
+        "-nogui",
+        "-config",
+        "default.cfg"
+      ];
+      const GS_LEVEL = 0;
+      const WP_PISTOL = 1;
+      const FRACUNIT = 1 << 16;
+      const DOOM_STATUS_BAR_HEIGHT = 32;
+      const DOOM_BASE_FRAME_HEIGHT = 200;
+
+      const statusElement = document.getElementById("status");
+      const canvasElement = document.getElementById("canvas");
+      const weaponOverlayElement = document.getElementById("weapon-overlay");
+      const weaponOverlayImage = document.getElementById("weapon-overlay-image");
+      window.__doomStandaloneState = {
+        scriptLoaded: false,
+        runtimeInitialized: false,
+        mainStarted: false,
+        bootRequested: false,
+        bootError: null,
+        gameplay: null,
+        weaponReplacement: {
+          manifestHandle: "",
+          loadState: "idle",
+          visible: false,
+          source: "",
+          pspriteSuppressed: false
+        },
+        weaponSound: {
+          packHandle: "",
+          preloadState: "idle",
+          lastPlaySource: "none",
+          lastPlayedHandle: "",
+          source: "",
+          lastError: ""
+        },
+        enemyReplacement: {
+          manifestHandle: "",
+          loadState: "idle",
+          visible: false,
+          source: "",
+          enemyType: -1
+        }
+      };
+
+      function setStatus(text, visible = true) {
+        statusElement.textContent = text;
+        statusElement.classList.toggle("is-hidden", !visible);
+      }
+
+      function recordBootError(message) {
+        window.__doomStandaloneState.bootError = message;
+      }
+
+      function startDoomMain() {
+        if (
+          !window.__doomStandaloneState.runtimeInitialized ||
+          window.__doomStandaloneState.mainStarted
+        ) {
+          return;
+        }
+
+        try {
+          console.info("[doom-shell] calling main with args:", commonArgs.join(" "));
+          setStatus("Starting Doom...", true);
+          callMain(commonArgs);
+          console.info("[doom-shell] callMain returned control");
+          setStatus("", false);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          recordBootError(message);
+          setStatus("Startup failed", true);
+          console.error("[doom-shell] callMain failed", error);
+        }
+      }
+
+      const recordAssetRuntimeError = (message) => {
+        const error = new Error(message);
+        console.error("[doom-shell]", error);
+        window.__doomModRuntimeLog = window.__doomModRuntimeLog ?? [];
+        window.__doomModRuntimeLog.push(`[doom-shell] ${message}`);
+        window.__doomModRuntimeLog = window.__doomModRuntimeLog.slice(-120);
+      };
+
+      const recordAssetRuntimeLog = (message) => {
+        console.warn("[doom-shell]", message);
+        window.__doomModRuntimeLog = window.__doomModRuntimeLog ?? [];
+        window.__doomModRuntimeLog.push(`[doom-shell] ${message}`);
+        window.__doomModRuntimeLog = window.__doomModRuntimeLog.slice(-120);
+      };
+
+      const browserAudioState = {
+        unlocked: false,
+        attempted: false,
+        context: null
+      };
+      const reportedRuntimeAssetFailures = new Set();
+
+      const getRuntimeBridge = () => {
+        if (window.Module && typeof window.Module.ccall === "function") {
+          return window.Module;
+        }
+        return null;
+      };
+
+      const reportRuntimeAssetFailure = (handle, reason) => {
+        const normalizedHandle = typeof handle === "string" ? handle.trim() : "";
+        const normalizedReason = typeof reason === "string" ? reason.trim() : "";
+        if (!normalizedHandle || !normalizedReason) {
+          return;
+        }
+
+        const dedupeKey = `${normalizedHandle}:${normalizedReason}`;
+        if (reportedRuntimeAssetFailures.has(dedupeKey)) {
+          return;
+        }
+        reportedRuntimeAssetFailures.add(dedupeKey);
+        recordAssetRuntimeError(`${normalizedHandle}: ${normalizedReason}`);
+
+        const parentWindow = window.parent;
+        const reporter =
+          parentWindow && parentWindow !== window
+            ? parentWindow.__doomModReportRuntimeAssetFailure
+            : window.__doomModReportRuntimeAssetFailure;
+        if (typeof reporter === "function") {
+          try {
+            reporter(normalizedHandle, normalizedReason);
+          } catch (_error) {
+            // Ignore parent reporting failures and keep the local fallback path.
+          }
+        }
+      };
+
+      const reportRuntimeAssetWarning = (handle, reason) => {
+        const normalizedHandle = typeof handle === "string" ? handle.trim() : "";
+        const normalizedReason = typeof reason === "string" ? reason.trim() : "";
+        if (!normalizedHandle || !normalizedReason) {
+          return;
+        }
+        const parentWindow = window.parent;
+        const reporter =
+          parentWindow && parentWindow !== window
+            ? parentWindow.__doomModReportRuntimeAssetWarning
+            : window.__doomModReportRuntimeAssetWarning;
+        if (typeof reporter === "function") {
+          try {
+            reporter(normalizedHandle, normalizedReason);
+          } catch (_error) {
+            // Ignore parent reporting failures and keep local logs.
+          }
+        }
+        recordAssetRuntimeLog(`runtime asset warning ${normalizedHandle}: ${normalizedReason}`);
+      };
+
+      const unlockBrowserAudio = async () => {
+        if (browserAudioState.unlocked) {
+          return true;
+        }
+
+        browserAudioState.attempted = true;
+
+        try {
+          const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+          if (AudioContextCtor && !browserAudioState.context) {
+            browserAudioState.context = new AudioContextCtor();
+          }
+
+          if (browserAudioState.context && browserAudioState.context.state === "suspended") {
+            await browserAudioState.context.resume();
+          }
+
+          if (browserAudioState.context) {
+            const gain = browserAudioState.context.createGain();
+            gain.gain.value = 0;
+            gain.connect(browserAudioState.context.destination);
+            const source = browserAudioState.context.createBufferSource();
+            source.buffer = browserAudioState.context.createBuffer(1, 1, 22050);
+            source.connect(gain);
+            source.start(0);
+          }
+
+          browserAudioState.unlocked = true;
+          return true;
+        } catch (error) {
+          recordAssetRuntimeError(
+            `Browser audio unlock failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+          return false;
+        }
+      };
+
+      const registerAudioUnlock = () => {
+        const unlockOnce = () => {
+          void unlockBrowserAudio();
+          window.removeEventListener("pointerdown", unlockOnce, true);
+          window.removeEventListener("keydown", unlockOnce, true);
+        };
+
+        window.addEventListener("pointerdown", unlockOnce, true);
+        window.addEventListener("keydown", unlockOnce, true);
+      };
+
+      const decodeAudioBuffer = async (audioBuffer) => {
+        const audioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!audioContextCtor) {
+          throw new Error("Browser AudioContext is unavailable");
+        }
+        if (!browserAudioState.context) {
+          browserAudioState.context = new audioContextCtor();
+        }
+        const context = browserAudioState.context;
+        const copy = audioBuffer.slice(0);
+        return context.decodeAudioData(copy);
+      };
+
+      window.__doomBootDoomShell = () => {
+        window.__doomStandaloneState.bootRequested = true;
+        if (window.__doomStandaloneState.bootError) {
+          window.__doomStandaloneState.bootError = null;
+        }
+        void unlockBrowserAudio();
+        if (window.__doomStandaloneState.runtimeInitialized) {
+          startDoomMain();
+        } else {
+          setStatus("Preparing Doom runtime...");
+        }
+        return true;
+      };
+
+      const lookupRuntimeAssetRecord = (handle) => {
+        const local = window.__doomModAssetRuntimeRecords || {};
+        if (Object.prototype.hasOwnProperty.call(local, handle)) {
+          return local[handle];
+        }
+        const parentWindow = window.parent;
+        if (parentWindow && parentWindow !== window) {
+          const parentRecords = parentWindow.__doomModAssetRuntimeRecords || {};
+          if (Object.prototype.hasOwnProperty.call(parentRecords, handle)) {
+            return parentRecords[handle];
+          }
+        }
+        return null;
+      };
+
+      const getRuntimeAssetUrl = (record) => {
+        if (!record) {
+          return "";
+        }
+        const bundleReadyUrl = getRuntimeWeaponRoleUrl(record, "ready");
+        if (bundleReadyUrl) {
+          return bundleReadyUrl;
+        }
+        if (typeof record.assetUrl === "string" && record.assetUrl.length > 0) {
+          return record.assetUrl;
+        }
+        if (typeof record.playbackUrl === "string" && record.playbackUrl.length > 0) {
+          return record.playbackUrl;
+        }
+        return "";
+      };
+
+      const getRuntimeWeaponBundle = (record) => {
+        if (!record || !record.bundle || record.bundle.kind !== "weapon_sprite_bundle") {
+          return null;
+        }
+        return record.bundle;
+      };
+
+      const getRuntimeEnemyBundle = (record) => {
+        if (!record || !record.bundle || record.bundle.kind !== "enemy_sprite_bundle") {
+          return null;
+        }
+        return record.bundle;
+      };
+
+      const getRuntimeHudBundle = (record) => {
+        if (!record || !record.bundle || record.bundle.kind !== "hud_patch_bundle") {
+          return null;
+        }
+        return record.bundle;
+      };
+
+      const getRuntimeWeaponRoleUrl = (record, role) => {
+        const bundle = getRuntimeWeaponBundle(record);
+        const roleRecord = bundle?.roles?.[role];
+        if (roleRecord && typeof roleRecord.assetUrl === "string" && roleRecord.assetUrl.length > 0) {
+          return roleRecord.assetUrl;
+        }
+        return "";
+      };
+
+      const getRuntimeBundleRoleUrl = (bundle, role) => {
+        const roleRecord = bundle?.roles?.[role];
+        if (roleRecord && typeof roleRecord.assetUrl === "string" && roleRecord.assetUrl.length > 0) {
+          return roleRecord.assetUrl;
+        }
+        return "";
+      };
+
+      const notifyWeaponSpriteReplacementReady = (weaponType, isReady) => {
+        const bridge = getRuntimeBridge();
+        if (!bridge) {
+          return;
+        }
+        try {
+          bridge.ccall(
+            "setWeaponSpriteReplacementReady",
+            null,
+            ["number", "number"],
+            [weaponType, isReady ? 1 : 0]
+          );
+        } catch (_error) {
+          // Ignore readiness update failures; asset registration already carries the primary state.
+        }
+      };
+
+      const resolveWeaponSpriteFromManifest = (handle) => {
+        const record = lookupRuntimeAssetRecord(handle);
+        const brief = (record?.brief || "").toLowerCase();
+
+        if (!brief) {
+          return -1;
+        }
+
+        const spriteNames = {
+          fish: 3,
+          pistol: 3,
+          shot: 1,
+          shotgun: 1,
+          chaingun: 7,
+          chainsaw: 8,
+          chainsawgun: 8,
+          plasma: 12,
+          rocket: 10,
+          missile: 9,
+          bfg: 14,
+          bullet: 3,
+          gun: 3
+        };
+
+        for (const [key, value] of Object.entries(spriteNames)) {
+          if (brief.includes(key)) {
+            return value;
+          }
+        }
+
+        if (record?.brief) {
+          let hash = 0;
+          for (let i = 0; i < handle.length; i++) {
+            hash = (hash * 1315423911 + handle.charCodeAt(i)) >>> 0;
+          }
+          const fallback = [3, 1, 5, 7, 8, 9, 10, 11, 12, 14, 15];
+          return fallback[hash % fallback.length];
+        }
+
+        return -1;
+      };
+
+      window.__doomModResolveWeaponSprite = (handle) => {
+        if (typeof handle !== "string" || handle.length === 0) {
+          return -1;
+        }
+        try {
+          return resolveWeaponSpriteFromManifest(handle);
+        } catch (_error) {
+          return -1;
+        }
+      };
+
+      const weaponOverlayState = {
+        manifestHandle: "",
+        imageUrl: "",
+        loaded: false,
+        pendingLoadId: 0,
+        error: null
+      };
+
+      const updateWeaponOverlayStatus = (updates) => {
+        window.__doomStandaloneState.weaponReplacement = {
+          ...(window.__doomStandaloneState.weaponReplacement || {}),
+          ...updates
+        };
+      };
+
+      const hideWeaponOverlay = () => {
+        weaponOverlayElement.style.display = "none";
+        updateWeaponOverlayStatus({ visible: false });
+      };
+
+      const clearWeaponOverlay = () => {
+        weaponOverlayState.manifestHandle = "";
+        weaponOverlayState.imageUrl = "";
+        weaponOverlayState.loaded = false;
+        weaponOverlayState.error = null;
+        weaponOverlayState.pendingLoadId += 1;
+        weaponOverlayImage.removeAttribute("src");
+        hideWeaponOverlay();
+        updateWeaponOverlayStatus({
+          manifestHandle: "",
+          loadState: "idle",
+          source: "",
+          pspriteSuppressed: false
+        });
+      };
+
+      const updateEnemyReplacementStatus = (updates) => {
+        window.__doomStandaloneState.enemyReplacement = {
+          ...(window.__doomStandaloneState.enemyReplacement || {}),
+          ...updates
+        };
+      };
+
+      const clearEnemyReplacement = (_enemyType) => {
+        updateEnemyReplacementStatus({
+          manifestHandle: "",
+          loadState: "idle",
+          visible: false,
+          source: "",
+          enemyType: -1
+        });
+      };
+
+      const clearNativeEnemyPatch = (enemyType) => {
+        const bridge = getRuntimeBridge();
+        if (!bridge) {
+          return false;
+        }
+        const clearFn =
+          typeof bridge._clearEnemyRuntimePatch === "function"
+            ? bridge._clearEnemyRuntimePatch.bind(bridge)
+            : typeof _clearEnemyRuntimePatch === "function"
+              ? _clearEnemyRuntimePatch
+              : null;
+        try {
+          if (clearFn) {
+            clearFn(enemyType);
+          } else {
+            bridge.ccall("clearEnemyRuntimePatch", null, ["number"], [enemyType]);
+          }
+          return true;
+        } catch (_error) {
+          return false;
+        }
+      };
+
+      const registerNativeEnemyPatch = (enemyType, patchBytes) => {
+        const bridge = getRuntimeBridge();
+        if (!bridge || !(patchBytes instanceof Uint8Array) || patchBytes.length === 0) {
+          return false;
+        }
+
+        return Boolean(
+          bridge.ccall(
+            "registerEnemyRuntimePatch",
+            "number",
+            ["number", "array", "number"],
+            [enemyType, patchBytes, patchBytes.length]
+          )
+        );
+      };
+
+      const registerNativeEnemyPatchRole = (enemyType, frameId, rotation, patchBytes) => {
+        const bridge = getRuntimeBridge();
+        if (!bridge || !(patchBytes instanceof Uint8Array) || patchBytes.length === 0) {
+          return false;
+        }
+
+        return Boolean(
+          bridge.ccall(
+            "registerEnemyRuntimePatchRole",
+            "number",
+            ["number", "number", "number", "array", "number"],
+            [enemyType, frameId, rotation, patchBytes, patchBytes.length]
+          )
+        );
+      };
+
+      const clearNativeHudFacePatches = () => {
+        const bridge = getRuntimeBridge();
+        if (!bridge) {
+          return false;
+        }
+        const clearFn =
+          typeof bridge._clearHudFaceRuntimePatches === "function"
+            ? bridge._clearHudFaceRuntimePatches.bind(bridge)
+            : typeof _clearHudFaceRuntimePatches === "function"
+              ? _clearHudFaceRuntimePatches
+              : null;
+        try {
+          if (clearFn) {
+            clearFn();
+          } else {
+            bridge.ccall("clearHudFaceRuntimePatches", null, [], []);
+          }
+          return true;
+        } catch (_error) {
+          return false;
+        }
+      };
+
+      const registerNativeHudFacePatch = (faceIndex, patchBytes) => {
+        const bridge = getRuntimeBridge();
+        if (!bridge || !(patchBytes instanceof Uint8Array) || patchBytes.length === 0) {
+          return false;
+        }
+
+        return Boolean(
+          bridge.ccall(
+            "registerHudFaceRuntimePatch",
+            "number",
+            ["number", "array", "number"],
+            [faceIndex, patchBytes, patchBytes.length]
+          )
+        );
+      };
+
+      const clearNativeWeaponPatches = (weaponType) => {
+        const bridge = getRuntimeBridge();
+        if (!bridge) {
+          return false;
+        }
+        const clearFn =
+          typeof bridge._clearWeaponRuntimePatches === "function"
+            ? bridge._clearWeaponRuntimePatches.bind(bridge)
+            : typeof _clearWeaponRuntimePatches === "function"
+              ? _clearWeaponRuntimePatches
+              : null;
+        try {
+          if (clearFn) {
+            clearFn(weaponType);
+          } else {
+            bridge.ccall("clearWeaponRuntimePatches", null, ["number"], [weaponType]);
+          }
+          return true;
+        } catch (_error) {
+          return false;
+        }
+      };
+
+      const registerNativeWeaponPatch = (weaponType, patchRole, patchBytes) => {
+        const bridge = getRuntimeBridge();
+        if (!bridge || !(patchBytes instanceof Uint8Array) || patchBytes.length === 0) {
+          return false;
+        }
+
+        return Boolean(
+          bridge.ccall(
+            "registerWeaponRuntimePatch",
+            "number",
+            ["number", "number", "array", "number"],
+            [weaponType, patchRole, patchBytes, patchBytes.length]
+          )
+        );
+      };
+
+      const getWeaponRenderBox = (target) => {
+        switch (target) {
+          case "fist":
+            return { width: 128, height: 112 };
+          case "chainsaw":
+            return { width: 176, height: 128 };
+          case "bfg9000":
+            return { width: 176, height: 128 };
+          case "rocket_launcher":
+            return { width: 168, height: 120 };
+          default:
+            return { width: 160, height: 112 };
+        }
+      };
+
+      const getWeaponVariantMargins = (target, variant) => {
+        const isLargeWeapon =
+          target === "chainsaw" || target === "bfg9000" || target === "rocket_launcher";
+        const side = isLargeWeapon ? 18 : 16;
+        const top = variant === "flash" ? 20 : variant === "attack" ? 16 : 12;
+        const bottom = target === "fist" ? 4 : variant === "attack" ? 10 : 6;
+        return { side, top, bottom };
+      };
+
+      const fitOpaqueBoundsIntoBox = (bounds, box, margins) => {
+        const innerWidth = Math.max(1, box.width - margins.side * 2);
+        const innerHeight = Math.max(1, box.height - margins.top - margins.bottom);
+        const scale = Math.min(innerWidth / bounds.width, innerHeight / bounds.height);
+        const drawWidth = Math.max(1, Math.round(bounds.width * scale));
+        const drawHeight = Math.max(1, Math.round(bounds.height * scale));
+        const baseX = Math.round((box.width - drawWidth) / 2);
+        const baseY = Math.round(box.height - margins.bottom - drawHeight);
+        return {
+          drawWidth,
+          drawHeight,
+          baseX,
+          baseY
+        };
+      };
+
+      const clampColor = (value) => Math.max(0, Math.min(255, Math.round(value)));
+
+      const rgba = (rgb, alpha) =>
+        `rgba(${clampColor(rgb[0])}, ${clampColor(rgb[1])}, ${clampColor(rgb[2])}, ${alpha})`;
+
+      const mixColor = (left, right, ratio) => [
+        clampColor(left[0] + (right[0] - left[0]) * ratio),
+        clampColor(left[1] + (right[1] - left[1]) * ratio),
+        clampColor(left[2] + (right[2] - left[2]) * ratio)
+      ];
+
+      const brightenColor = (rgb, amount) => [
+        clampColor(rgb[0] + (255 - rgb[0]) * amount),
+        clampColor(rgb[1] + (255 - rgb[1]) * amount),
+        clampColor(rgb[2] + (255 - rgb[2]) * amount)
+      ];
+
+      const getWeaponEffectPalette = (imageData) => {
+        const { data, width, height } = imageData;
+        let count = 0;
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+        let brightest = [255, 220, 120];
+        let brightestScore = -1;
+
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const offset = (y * width + x) * 4;
+            const alpha = data[offset + 3];
+            if (alpha < 48) {
+              continue;
+            }
+
+            const r = data[offset];
+            const g = data[offset + 1];
+            const b = data[offset + 2];
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            count += 1;
+
+            const score = r * 0.299 + g * 0.587 + b * 0.114;
+            if (score > brightestScore) {
+              brightestScore = score;
+              brightest = [r, g, b];
+            }
+          }
+        }
+
+        if (count === 0) {
+          return {
+            primary: [255, 180, 80],
+            secondary: [255, 235, 170],
+            accent: [255, 120, 40]
+          };
+        }
+
+        const average = [
+          Math.round(sumR / count),
+          Math.round(sumG / count),
+          Math.round(sumB / count)
+        ];
+        return {
+          primary: average,
+          secondary: brightenColor(brightest, 0.25),
+          accent: mixColor(average, brightest, 0.55)
+        };
+      };
+
+      const getWeaponFlashTheme = (brief, target) => {
+        const normalized = typeof brief === "string" ? brief.toLowerCase() : "";
+        if (
+          normalized.includes("bubble")
+          || normalized.includes("foam")
+          || normalized.includes("soap")
+        ) {
+          return "bubble";
+        }
+        if (
+          normalized.includes("sandwich")
+          || normalized.includes("burger")
+          || normalized.includes("pizza")
+          || normalized.includes("taco")
+          || normalized.includes("food")
+          || normalized.includes("lettuce")
+          || normalized.includes("meat")
+        ) {
+          return "food";
+        }
+        if (
+          normalized.includes("candy")
+          || normalized.includes("magic")
+          || normalized.includes("sparkle")
+          || normalized.includes("wand")
+          || normalized.includes("star")
+          || normalized.includes("crystal")
+        ) {
+          return "sparkle";
+        }
+        if (
+          normalized.includes("fish")
+          || normalized.includes("water")
+          || normalized.includes("ocean")
+          || normalized.includes("aquatic")
+          || normalized.includes("splash")
+        ) {
+          return "water";
+        }
+        if (target === "plasma_rifle" || normalized.includes("plasma") || normalized.includes("electric")) {
+          return "sparkle";
+        }
+        return "burst";
+      };
+
+      const drawBubbleFlash = (context, centerX, centerY, palette) => {
+        for (let i = 0; i < 5; i += 1) {
+          const radius = 5 + i * 3;
+          const bubbleX = centerX + (i - 2) * 6;
+          const bubbleY = centerY - 8 - i * 5;
+          context.fillStyle = rgba(brightenColor(palette.secondary, 0.3), 0.18);
+          context.strokeStyle = rgba(brightenColor(palette.primary, 0.45), 0.72);
+          context.lineWidth = 2;
+          context.beginPath();
+          context.arc(bubbleX, bubbleY, radius, 0, Math.PI * 2);
+          context.fill();
+          context.stroke();
+          context.fillStyle = "rgba(255,255,255,0.5)";
+          context.beginPath();
+          context.arc(bubbleX - radius * 0.25, bubbleY - radius * 0.28, Math.max(1.5, radius * 0.18), 0, Math.PI * 2);
+          context.fill();
+        }
+      };
+
+      const drawFoodFlash = (context, centerX, centerY, palette) => {
+        const sauceGlow = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, 24);
+        sauceGlow.addColorStop(0, rgba(brightenColor(palette.secondary, 0.4), 0.98));
+        sauceGlow.addColorStop(0.55, rgba(brightenColor(palette.primary, 0.25), 0.62));
+        sauceGlow.addColorStop(1, rgba(palette.primary, 0));
+        context.fillStyle = sauceGlow;
+        context.beginPath();
+        context.arc(centerX, centerY, 24, 0, Math.PI * 2);
+        context.fill();
+
+        context.save();
+        context.strokeStyle = rgba(brightenColor(palette.accent, 0.15), 0.92);
+        context.lineWidth = 3;
+        context.lineCap = "round";
+        for (let i = 0; i < 4; i += 1) {
+          const angle = (-0.55 + i * 0.28);
+          const length = 18 + i * 5;
+          context.beginPath();
+          context.moveTo(centerX, centerY);
+          context.lineTo(centerX + Math.cos(angle) * length, centerY - 4 + Math.sin(angle) * length);
+          context.stroke();
+        }
+        context.restore();
+
+        const crumbColors = [
+          brightenColor(palette.secondary, 0.15),
+          palette.primary,
+          palette.accent
+        ];
+        for (let i = 0; i < 7; i += 1) {
+          const x = centerX + (i - 3) * 5;
+          const y = centerY - 8 - (i % 3) * 5;
+          context.save();
+          context.translate(x, y);
+          context.rotate((i - 3) * 0.24);
+          context.fillStyle = rgba(crumbColors[i % crumbColors.length], 0.85);
+          context.beginPath();
+          context.ellipse(0, 0, 5 + (i % 2), 2.5 + (i % 3), 0, 0, Math.PI * 2);
+          context.fill();
+          context.restore();
+        }
+      };
+
+      const drawSparkleFlash = (context, centerX, centerY, palette) => {
+        const sparkleColor = brightenColor(palette.secondary, 0.2);
+        context.save();
+        context.strokeStyle = rgba(sparkleColor, 0.92);
+        context.lineWidth = 2;
+        for (let i = 0; i < 4; i += 1) {
+          const angle = (Math.PI / 4) * i;
+          const dx = Math.cos(angle) * 14;
+          const dy = Math.sin(angle) * 14;
+          context.beginPath();
+          context.moveTo(centerX - dx, centerY - dy);
+          context.lineTo(centerX + dx, centerY + dy);
+          context.stroke();
+        }
+        context.restore();
+        for (let i = 0; i < 3; i += 1) {
+          const starX = centerX + (i - 1) * 10;
+          const starY = centerY - 10 - i * 4;
+          context.fillStyle = rgba(brightenColor(palette.accent, 0.25), 0.78);
+          context.beginPath();
+          context.moveTo(starX, starY - 5);
+          context.lineTo(starX + 3, starY - 1);
+          context.lineTo(starX + 7, starY);
+          context.lineTo(starX + 3, starY + 2);
+          context.lineTo(starX + 1, starY + 7);
+          context.lineTo(starX - 2, starY + 2);
+          context.lineTo(starX - 7, starY);
+          context.lineTo(starX - 2, starY - 1);
+          context.closePath();
+          context.fill();
+        }
+      };
+
+      const drawWaterFlash = (context, centerX, centerY, palette) => {
+        context.save();
+        context.strokeStyle = rgba(brightenColor(palette.secondary, 0.2), 0.82);
+        context.lineWidth = 2.5;
+        context.lineCap = "round";
+        for (let i = 0; i < 3; i += 1) {
+          const x = centerX + (i - 1) * 8;
+          context.beginPath();
+          context.moveTo(x, centerY + 6);
+          context.quadraticCurveTo(x - 2, centerY - 2, x + (i - 1) * 3, centerY - 14 - i * 4);
+          context.stroke();
+        }
+        context.restore();
+        for (let i = 0; i < 6; i += 1) {
+          const dropX = centerX + (i - 2.5) * 5;
+          const dropY = centerY - 8 - i * 3;
+          context.fillStyle = rgba(brightenColor(palette.primary, 0.1), 0.76);
+          context.beginPath();
+          context.ellipse(dropX, dropY, 2.2, 4.4, 0, 0, Math.PI * 2);
+          context.fill();
+        }
+      };
+
+      const drawBurstFlash = (context, centerX, centerY, palette) => {
+        for (let i = 0; i < 5; i += 1) {
+          const radius = 9 + i * 6;
+          const gradient = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, radius);
+          gradient.addColorStop(0, rgba(brightenColor(palette.secondary, 0.42), 1));
+          gradient.addColorStop(0.45, rgba(brightenColor(palette.accent, 0.18), 0.76));
+          gradient.addColorStop(1, rgba(palette.primary, 0));
+          context.fillStyle = gradient;
+          context.beginPath();
+          context.arc(centerX, centerY, radius, 0, Math.PI * 2);
+          context.fill();
+        }
+        context.save();
+        context.strokeStyle = rgba(brightenColor(palette.secondary, 0.5), 0.95);
+        context.lineWidth = 3;
+        context.lineCap = "round";
+        for (let i = 0; i < 4; i += 1) {
+          const angle = (-0.45 + i * 0.3);
+          const length = 16 + i * 6;
+          context.beginPath();
+          context.moveTo(centerX, centerY);
+          context.lineTo(centerX + Math.cos(angle) * length, centerY + Math.sin(angle) * length);
+          context.stroke();
+        }
+        context.restore();
+      };
+
+      const drawWeaponFlash = (context, placement, box, brief, target, sourceImage, flashOrigin) => {
+        const fallbackX = Math.round(placement.baseX + placement.drawWidth * 0.5);
+        const fallbackY = Math.round(placement.baseY + placement.drawHeight * 0.5);
+        const centerX = Number.isFinite(flashOrigin?.x)
+          ? Math.max(6, Math.min(box.width - 6, flashOrigin.x))
+          : fallbackX;
+        const centerY = Number.isFinite(flashOrigin?.y)
+          ? Math.max(6, Math.min(box.height - 6, flashOrigin.y))
+          : fallbackY;
+        const palette = getWeaponEffectPalette(sourceImage);
+        const theme = getWeaponFlashTheme(brief, target);
+
+        context.save();
+        context.globalCompositeOperation = "screen";
+        if (theme === "bubble") {
+          drawBubbleFlash(context, centerX, centerY, palette);
+        } else if (theme === "food") {
+          drawFoodFlash(context, centerX, centerY, palette);
+        } else if (theme === "sparkle") {
+          drawSparkleFlash(context, centerX, centerY, palette);
+        } else if (theme === "water") {
+          drawWaterFlash(context, centerX, centerY, palette);
+        } else {
+          drawBurstFlash(context, centerX, centerY, palette);
+        }
+        context.restore();
+      };
+
+      const loadImageElement = (assetUrl) =>
+        new Promise((resolve, reject) => {
+          const image = new Image();
+          image.crossOrigin = "anonymous";
+          image.onload = () => resolve(image);
+          image.onerror = () => reject(new Error(`Failed to load generated weapon image: ${assetUrl}`));
+          image.src = assetUrl;
+        });
+
+      const OPAQUE_BOUNDS_ALPHA_THRESHOLD = 56;
+      const OPAQUE_BOUNDS_PADDING_PIXELS = 3;
+      const PATCH_OPAQUE_ALPHA_THRESHOLD = 72;
+      const WEAPON_ROLE_MUZZLE_SAMPLE_BAND = 0.22;
+      const WEAPON_ROLE_MUZZLE_DRIFT_PX = 4;
+      const WEAPON_ROLE_BOUNDS_MAX_RATIO = 1.35;
+      const WEAPON_ROLE_BOUNDS_MIN_RATIO = 0.74;
+
+      const estimateMuzzlePoint = (imageData, bounds) => {
+        const { data, width, height } = imageData;
+        const bandWidth = Math.max(4, Math.round((bounds.width || 1) * WEAPON_ROLE_MUZZLE_SAMPLE_BAND));
+        const muzzleThreshold = Math.max(bounds.x, bounds.x + bounds.width - bandWidth);
+        const upperBandHeight = Math.max(4, Math.round((bounds.height || 1) * 0.42));
+        const upperBandLimit = Math.min(bounds.y + bounds.height - 1, bounds.y + upperBandHeight);
+
+        const collectCandidates = (predicate) => {
+          const points = [];
+          for (let y = 0; y < height; y += 1) {
+            const rowStart = y * width;
+            for (let x = 0; x < width; x += 1) {
+              const alpha = data[(rowStart + x) * 4 + 3];
+              if (alpha < OPAQUE_BOUNDS_ALPHA_THRESHOLD) {
+                continue;
+              }
+              if (x < bounds.x || x > bounds.x + bounds.width - 1 || y < bounds.y || y > bounds.y + bounds.height - 1) {
+                continue;
+              }
+              if (predicate(x, y)) {
+                points.push([x, y]);
+              }
+            }
+          }
+          return points;
+        };
+
+        const upperFrontCandidates = collectCandidates((x, y) => x >= muzzleThreshold && y <= upperBandLimit);
+        if (upperFrontCandidates.length > 0) {
+          const sumX = upperFrontCandidates.reduce((total, point) => total + point[0], 0);
+          const sumY = upperFrontCandidates.reduce((total, point) => total + point[1], 0);
+          return {
+            x: Math.round(sumX / upperFrontCandidates.length),
+            y: Math.round(sumY / upperFrontCandidates.length)
+          };
+        }
+
+        const bandCandidates = collectCandidates((x) => x >= muzzleThreshold);
+
+        if (bandCandidates.length > 0) {
+          const sumX = bandCandidates.reduce((total, point) => total + point[0], 0);
+          const sumY = bandCandidates.reduce((total, point) => total + point[1], 0);
+          return {
+            x: Math.round(sumX / bandCandidates.length),
+            y: Math.round(sumY / bandCandidates.length)
+          };
+        }
+
+        return {
+          x: bounds.x + Math.floor((bounds.width || 1) / 2),
+          y: bounds.y + Math.floor((bounds.height || 1) / 2)
+        };
+      };
+
+      const buildSharedWeaponAnchorFromImage = (imageData, sourceWidth, sourceHeight, target, weaponTemplate) => {
+        const bounds = findOpaqueBounds(imageData) || {
+          x: 0,
+          y: 0,
+          width: sourceWidth,
+          height: sourceHeight
+        };
+        const box = getWeaponRenderBox(target);
+        const readyMargins = getWeaponVariantMargins(target, "ready");
+        const placement = fitOpaqueBoundsIntoBox(bounds, box, readyMargins);
+        const scale = placement.drawWidth / Math.max(1, bounds.width);
+        const template = weaponTemplate || {};
+        const templateBounds = template.sourceBounds || {};
+        const templateMuzzle = template.muzzlePoint || {};
+        const fallbackMuzzle = estimateMuzzlePoint(imageData, bounds);
+        const muzzle = {
+          x: Number.isFinite(templateMuzzle.x) ? templateMuzzle.x : fallbackMuzzle.x,
+          y: Number.isFinite(templateMuzzle.y) ? templateMuzzle.y : fallbackMuzzle.y
+        };
+        const flashOrigin = {
+          x: Math.round(placement.baseX + (muzzle.x - bounds.x) * scale),
+          y: Math.round(placement.baseY + (muzzle.y - bounds.y) * scale)
+        };
+        if (target === "pistol") {
+          flashOrigin.x = Math.round(placement.baseX + placement.drawWidth * 0.56);
+          flashOrigin.y = Math.round(placement.baseY + placement.drawHeight * 0.16);
+        }
+        return {
+          sourceBounds: bounds,
+          placement: {
+            baseX: placement.baseX,
+            baseY: placement.baseY,
+            drawWidth: placement.drawWidth,
+            drawHeight: placement.drawHeight,
+            scale
+          },
+          renderBox: box,
+          sourceCanvas: { width: sourceWidth, height: sourceHeight },
+          flashOrigin
+        };
+      };
+
+      const normalizeSharedAnchor = (bundleMetadata, sourceImageData, sourceWidth, sourceHeight, target) => {
+        const metadata = bundleMetadata?.sharedAnchor ?? bundleMetadata;
+        if (
+          metadata?.sourceBounds &&
+          metadata?.placement &&
+          metadata?.renderBox
+        ) {
+          return metadata;
+        }
+        const template = metadata?.weaponTemplate || bundleMetadata?.weaponTemplate;
+        return buildSharedWeaponAnchorFromImage(sourceImageData, sourceWidth, sourceHeight, target, template);
+      };
+
+      const rasterizeImage = (image) => {
+        const sourceCanvas = document.createElement("canvas");
+        sourceCanvas.width = image.naturalWidth || image.width;
+        sourceCanvas.height = image.naturalHeight || image.height;
+        const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
+        sourceContext.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+        sourceContext.drawImage(image, 0, 0);
+        return {
+          sourceCanvas,
+          sourceImage: sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height)
+        };
+      };
+
+      const evaluateWeaponRoleAnchorAlignment = (sourceImageData, sharedAnchor, role) => {
+        if (!sharedAnchor || !sharedAnchor.sourceBounds || !sharedAnchor.placement) {
+          return {
+            ok: true,
+            metrics: {}
+          };
+        }
+
+        const bounds = findOpaqueBounds(sourceImageData) || {
+          x: 0,
+          y: 0,
+          width: sourceImageData.width,
+          height: sourceImageData.height
+        };
+        const muzzle = estimateMuzzlePoint(sourceImageData, bounds);
+        const sourceBounds = sharedAnchor.sourceBounds || {
+          x: 0,
+          y: 0,
+          width: sourceImageData.width,
+          height: sourceImageData.height
+        };
+        const placement = sharedAnchor.placement || {};
+        const scale = Number.isFinite(placement.scale)
+          ? placement.scale
+          : (placement.drawWidth || 1) / Math.max(1, sourceBounds.width || 1);
+        const expectedFlash = sharedAnchor.flashOrigin || {};
+        const projectedMuzzleX = Math.round(
+          (Number.isFinite(placement.baseX) ? placement.baseX : 0)
+          - (Number.isFinite(sourceBounds.x) ? sourceBounds.x : 0) * scale
+          + (Number.isFinite(muzzle.x) ? muzzle.x : 0) * scale
+        );
+        const projectedMuzzleY = Math.round(
+          (Number.isFinite(placement.baseY) ? placement.baseY : 0)
+          - (Number.isFinite(sourceBounds.y) ? sourceBounds.y : 0) * scale
+          + (Number.isFinite(muzzle.y) ? muzzle.y : 0) * scale
+        );
+        const flashX = Number.isFinite(expectedFlash.x) ? expectedFlash.x : projectedMuzzleX;
+        const flashY = Number.isFinite(expectedFlash.y) ? expectedFlash.y : projectedMuzzleY;
+        const muzzleDeltaPx = Math.max(Math.abs(projectedMuzzleX - flashX), Math.abs(projectedMuzzleY - flashY));
+        const roleWidth = Math.max(1, bounds.width);
+        const roleHeight = Math.max(1, bounds.height);
+        const referenceWidth = Math.max(1, Number(sourceBounds.width) || 1);
+        const referenceHeight = Math.max(1, Number(sourceBounds.height) || 1);
+        const sizeRatioW = roleWidth / referenceWidth;
+        const sizeRatioH = roleHeight / referenceHeight;
+        const maxRatio = Math.max(sizeRatioW, 1 / sizeRatioW, sizeRatioH, 1 / sizeRatioH);
+        const minRatio = Math.min(sizeRatioW, 1 / sizeRatioW, sizeRatioH, 1 / sizeRatioH);
+        const metrics = {
+          sizeRatio: maxRatio,
+          sizeRatioMin: minRatio,
+          muzzleDx: sourceBounds.width ? Math.abs(projectedMuzzleX - flashX) / sourceBounds.width : 0,
+          muzzleDy: sourceBounds.height ? Math.abs(projectedMuzzleY - flashY) / sourceBounds.height : 0,
+          muzzleDeltaPx
+        };
+        if (role !== "flash" && (maxRatio > WEAPON_ROLE_BOUNDS_MAX_RATIO || minRatio < WEAPON_ROLE_BOUNDS_MIN_RATIO)) {
+          metrics.identityDrift = 1;
+        }
+        if (muzzleDeltaPx > WEAPON_ROLE_MUZZLE_DRIFT_PX) {
+          metrics.anchorDriftPx = muzzleDeltaPx;
+        }
+        const ok =
+          maxRatio <= WEAPON_ROLE_BOUNDS_MAX_RATIO &&
+          minRatio >= WEAPON_ROLE_BOUNDS_MIN_RATIO &&
+          muzzleDeltaPx <= WEAPON_ROLE_MUZZLE_DRIFT_PX;
+        return { ok, metrics };
+      };
+
+      const findOpaqueBounds = (imageData) => {
+        const { data, width, height } = imageData;
+        let minX = width;
+        let minY = height;
+        let maxX = -1;
+        let maxY = -1;
+
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const alpha = data[(y * width + x) * 4 + 3];
+            if (alpha < OPAQUE_BOUNDS_ALPHA_THRESHOLD) {
+              continue;
+            }
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+          }
+        }
+
+        if (maxX < minX || maxY < minY) {
+          return null;
+        }
+
+        return {
+          x: Math.max(0, minX - OPAQUE_BOUNDS_PADDING_PIXELS),
+          y: Math.max(0, minY - OPAQUE_BOUNDS_PADDING_PIXELS),
+          width:
+            Math.min(width - 1, maxX + OPAQUE_BOUNDS_PADDING_PIXELS)
+            - Math.max(0, minX - OPAQUE_BOUNDS_PADDING_PIXELS)
+            + 1,
+          height:
+            Math.min(height - 1, maxY + OPAQUE_BOUNDS_PADDING_PIXELS)
+            - Math.max(0, minY - OPAQUE_BOUNDS_PADDING_PIXELS)
+            + 1
+        };
+      };
+
+      const renderWeaponVariant = (image, target, variant, brief) => {
+        return renderPreparedWeaponRoleImage(
+          image,
+          target,
+          variant,
+          null,
+          variant === "flash"
+            ? { synthesizeFlash: true, brief }
+            : variant === "attack"
+              ? { synthesizeAttack: true }
+              : {}
+        );
+      };
+
+      const renderPreparedWeaponRoleImage = (
+        image,
+        target,
+        role,
+        sharedAnchor,
+        options = {}
+      ) => {
+        const { sourceCanvas, sourceImage } = rasterizeImage(image);
+        const bounds = findOpaqueBounds(sourceImage) || {
+          x: 0,
+          y: 0,
+          width: sourceCanvas.width,
+          height: sourceCanvas.height
+        };
+
+        const box = getWeaponRenderBox(target);
+        const margins = getWeaponVariantMargins(target, "ready");
+        const canvas = document.createElement("canvas");
+        canvas.width = box.width;
+        canvas.height = box.height;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        context.imageSmoothingEnabled = false;
+        context.clearRect(0, 0, canvas.width, canvas.height);
+
+        const sharedAnchorNormalized = normalizeSharedAnchor(
+          sharedAnchor,
+          sourceImage,
+          sourceCanvas.width,
+          sourceCanvas.height,
+          target
+        );
+
+        const shouldDrawSource =
+          !(role === "flash" && options?.synthesizeFlash);
+
+        if (
+          sharedAnchorNormalized?.sourceBounds &&
+          sharedAnchorNormalized?.placement &&
+          sharedAnchorNormalized?.renderBox &&
+          shouldDrawSource
+        ) {
+          const sourceBounds = sharedAnchorNormalized.sourceBounds;
+          const placement = sharedAnchorNormalized.placement;
+          const scale =
+            typeof placement.scale === "number"
+              ? placement.scale
+              : placement.drawWidth / Math.max(1, sourceBounds.width);
+          const drawWidth = Math.max(1, Math.round(sourceCanvas.width * scale));
+          const drawHeight = Math.max(1, Math.round(sourceCanvas.height * scale));
+          const destX = Math.round(placement.baseX - sourceBounds.x * scale);
+          const destY = Math.round(placement.baseY - sourceBounds.y * scale);
+          context.drawImage(sourceCanvas, 0, 0, sourceCanvas.width, sourceCanvas.height, destX, destY, drawWidth, drawHeight);
+        } else if (shouldDrawSource) {
+          const placement = fitOpaqueBoundsIntoBox(bounds, box, margins);
+          context.drawImage(
+            sourceCanvas,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+            placement.baseX,
+            placement.baseY,
+            placement.drawWidth,
+            placement.drawHeight
+          );
+        }
+
+        if (role === "attack" && options?.synthesizeAttack) {
+          context.globalCompositeOperation = "screen";
+          context.globalAlpha = 0.18;
+          context.drawImage(canvas, 2, -8);
+          context.globalAlpha = 1;
+          context.globalCompositeOperation = "source-over";
+        }
+
+        if (role === "flash" && options?.synthesizeFlash) {
+          drawWeaponFlash(
+            context,
+            sharedAnchorNormalized?.placement || {
+              baseX: 0,
+              baseY: 0,
+              drawWidth: 0,
+              drawHeight: 0
+            },
+            box,
+            options?.brief || "",
+            target,
+            sourceImage,
+            options?.flashOrigin
+          );
+        }
+        return canvas;
+      };
+
+      const buildEnemySharedAnchorFromImage = (imageData, sourceWidth, sourceHeight) => {
+        const bounds = findOpaqueBounds(imageData) || {
+          x: 0,
+          y: 0,
+          width: sourceWidth,
+          height: sourceHeight
+        };
+        const box = { width: 96, height: 112 };
+        const targetSpriteBox = { width: 44, height: 62 };
+        const placement = fitOpaqueBoundsIntoBox(bounds, targetSpriteBox, { side: 0, top: 0, bottom: 0 });
+        placement.baseX = Math.round((box.width - placement.drawWidth) / 2);
+        placement.baseY = Math.round(box.height - 4 - placement.drawHeight);
+        const scale = placement.drawWidth / Math.max(1, bounds.width);
+        return {
+          sourceBounds: bounds,
+          placement,
+          scale,
+          renderBox: box,
+          footAnchor: {
+            x: placement.baseX + Math.round(placement.drawWidth / 2),
+            y: placement.baseY + placement.drawHeight
+          },
+          centerline: placement.baseX + Math.round(placement.drawWidth / 2)
+        };
+      };
+
+      const normalizeEnemySharedAnchor = (bundleMetadata, sourceImageData, sourceWidth, sourceHeight) => {
+        const metadata = bundleMetadata?.sharedAnchor ?? bundleMetadata;
+        if (
+          metadata?.sourceBounds &&
+          metadata?.placement &&
+          metadata?.renderBox &&
+          metadata?.footAnchor &&
+          Number.isFinite(metadata?.centerline)
+        ) {
+          return metadata;
+        }
+        return buildEnemySharedAnchorFromImage(sourceImageData, sourceWidth, sourceHeight);
+      };
+
+      const getEnemyDeathPlacement = (bounds, sharedAnchor) => {
+        const box = sharedAnchor?.renderBox || { width: 96, height: 112 };
+        const footAnchor = sharedAnchor?.footAnchor || {
+          x: Math.round(box.width / 2),
+          y: box.height - 4
+        };
+        const margins = { side: 6, top: 18, bottom: 2 };
+        const maxFit = fitOpaqueBoundsIntoBox(bounds, box, margins);
+        const sharedScale = Number.isFinite(sharedAnchor?.scale)
+          ? sharedAnchor.scale
+          : (sharedAnchor?.placement?.drawWidth || 1) / Math.max(1, sharedAnchor?.sourceBounds?.width || 1);
+        const maxFitScale = maxFit.drawWidth / Math.max(1, bounds.width);
+        const scale = Math.min(sharedScale, maxFitScale);
+        const fitted = {
+          drawWidth: Math.max(1, Math.round(bounds.width * scale)),
+          drawHeight: Math.max(1, Math.round(bounds.height * scale))
+        };
+        const baseX = Math.max(
+          0,
+          Math.min(box.width - fitted.drawWidth, Math.round(footAnchor.x - fitted.drawWidth / 2))
+        );
+        const baseY = Math.max(
+          0,
+          Math.min(box.height - fitted.drawHeight, Math.round(footAnchor.y - fitted.drawHeight))
+        );
+        return {
+          drawWidth: fitted.drawWidth,
+          drawHeight: fitted.drawHeight,
+          baseX,
+          baseY
+        };
+      };
+
+      const renderEnemyVariant = (image, sharedAnchor = null, role = "") => {
+        const sourceCanvas = document.createElement("canvas");
+        sourceCanvas.width = image.naturalWidth || image.width;
+        sourceCanvas.height = image.naturalHeight || image.height;
+        const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
+        sourceContext.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+        sourceContext.drawImage(image, 0, 0);
+        const sourceImage = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+        const bounds = findOpaqueBounds(sourceImage) || {
+          x: 0,
+          y: 0,
+          width: sourceCanvas.width,
+          height: sourceCanvas.height
+        };
+
+        const canvas = document.createElement("canvas");
+        canvas.width = 96;
+        canvas.height = 112;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        context.imageSmoothingEnabled = false;
+        context.clearRect(0, 0, canvas.width, canvas.height);
+
+        let placement;
+        if (sharedAnchor?.placement && role && role.startsWith("death_")) {
+          placement = getEnemyDeathPlacement(bounds, sharedAnchor);
+        } else if (sharedAnchor?.placement) {
+          placement = sharedAnchor.placement;
+        } else {
+          const margins = { side: 8, top: 6, bottom: 4 };
+          placement = fitOpaqueBoundsIntoBox(
+            bounds,
+            { width: canvas.width, height: canvas.height },
+            margins
+          );
+        }
+
+        context.drawImage(
+          sourceCanvas,
+          bounds.x,
+          bounds.y,
+          bounds.width,
+          bounds.height,
+          placement.baseX,
+          placement.baseY,
+          placement.drawWidth,
+          placement.drawHeight
+        );
+
+        return canvas;
+      };
+
+      const renderImageCanvas = (image) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth || image.width;
+        canvas.height = image.naturalHeight || image.height;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        context.imageSmoothingEnabled = false;
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0);
+        return canvas;
+      };
+
+      const ENEMY_AUTHORED_ROTATION_MAP = {
+        front: { rotation: 0, mirrorTarget: null },
+        front_right: { rotation: 1, mirrorTarget: 7 },
+        right: { rotation: 2, mirrorTarget: 6 },
+        back_right: { rotation: 3, mirrorTarget: 5 },
+        back: { rotation: 4, mirrorTarget: null }
+      };
+
+      const mirrorCanvasHorizontally = (canvas) => {
+        const mirrored = document.createElement("canvas");
+        mirrored.width = canvas.width;
+        mirrored.height = canvas.height;
+        const context = mirrored.getContext("2d", { willReadFrequently: true });
+        context.imageSmoothingEnabled = false;
+        context.translate(mirrored.width, 0);
+        context.scale(-1, 1);
+        context.drawImage(canvas, 0, 0);
+        return mirrored;
+      };
+
+      const quantizeCanvasToPatch = async (canvas, patchRole, offsetOptions) => {
+        const palette = await getDoomPalette();
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+        const opaque = new Uint8Array(canvas.width * canvas.height);
+        const indices = new Uint8Array(canvas.width * canvas.height);
+
+        for (let y = 0; y < canvas.height; y += 1) {
+          for (let x = 0; x < canvas.width; x += 1) {
+            const offset = (y * canvas.width + x) * 4;
+            const alpha = imageData.data[offset + 3];
+            const pixelIndex = y * canvas.width + x;
+            if (alpha < PATCH_OPAQUE_ALPHA_THRESHOLD) {
+              opaque[pixelIndex] = 0;
+              indices[pixelIndex] = 0;
+              continue;
+            }
+
+            opaque[pixelIndex] = 1;
+            let best = 0;
+            let bestDistance = Number.POSITIVE_INFINITY;
+            const r = imageData.data[offset];
+            const g = imageData.data[offset + 1];
+            const b = imageData.data[offset + 2];
+            for (let i = 0; i < palette.length; i += 1) {
+              const dr = r - palette[i][0];
+              const dg = g - palette[i][1];
+              const db = b - palette[i][2];
+              const distance = dr * dr + dg * dg + db * db;
+              if (distance < bestDistance) {
+                best = i;
+                bestDistance = distance;
+              }
+            }
+            indices[pixelIndex] = best;
+          }
+        }
+
+        const topOffset = Number.isFinite(offsetOptions?.topOffsetOverride)
+          ? offsetOptions.topOffsetOverride
+          : canvas.height;
+        const leftOffset = Number.isFinite(offsetOptions?.leftOffsetOverride)
+          ? offsetOptions.leftOffsetOverride
+          : Math.round(canvas.width / 2);
+        return buildDoomPatchBytes(
+          canvas.width,
+          canvas.height,
+          leftOffset,
+          topOffset,
+          indices,
+          opaque
+        );
+      };
+
+      const buildDoomPatchBytes = (width, height, leftOffset, topOffset, indices, opaque) => {
+        const bytes = [];
+        const writeInt16 = (value) => {
+          const normalized = ((value % 0x10000) + 0x10000) % 0x10000;
+          bytes.push(normalized & 0xff, (normalized >> 8) & 0xff);
+        };
+        const writeInt32 = (value) => {
+          const normalized = value >>> 0;
+          bytes.push(
+            normalized & 0xff,
+            (normalized >> 8) & 0xff,
+            (normalized >> 16) & 0xff,
+            (normalized >> 24) & 0xff
+          );
+        };
+
+        writeInt16(width);
+        writeInt16(height);
+        writeInt16(leftOffset);
+        writeInt16(topOffset);
+
+        const columnOffsetPositions = [];
+        for (let x = 0; x < width; x += 1) {
+          columnOffsetPositions.push(bytes.length);
+          writeInt32(0);
+        }
+
+        for (let x = 0; x < width; x += 1) {
+          const columnStart = bytes.length;
+          const pointerOffset = columnOffsetPositions[x];
+          const normalizedStart = columnStart >>> 0;
+          bytes[pointerOffset] = normalizedStart & 0xff;
+          bytes[pointerOffset + 1] = (normalizedStart >> 8) & 0xff;
+          bytes[pointerOffset + 2] = (normalizedStart >> 16) & 0xff;
+          bytes[pointerOffset + 3] = (normalizedStart >> 24) & 0xff;
+
+          let y = 0;
+          while (y < height) {
+            while (y < height && opaque[y * width + x] === 0) {
+              y += 1;
+            }
+            if (y >= height) {
+              break;
+            }
+
+            const runStart = y;
+            while (y < height && opaque[y * width + x] !== 0) {
+              y += 1;
+            }
+            const length = y - runStart;
+            bytes.push(runStart & 0xff, length & 0xff, 0x00);
+            for (let row = runStart; row < runStart + length; row += 1) {
+              bytes.push(indices[row * width + x]);
+            }
+            bytes.push(0x00);
+          }
+
+          bytes.push(0xff);
+        }
+
+        return Uint8Array.from(bytes);
+      };
+
+      const readPatchUInt16 = (patchBytes, offset) =>
+        patchBytes[offset] | (patchBytes[offset + 1] << 8);
+
+      const readPatchUInt32 = (patchBytes, offset) =>
+        patchBytes[offset]
+        | (patchBytes[offset + 1] << 8)
+        | (patchBytes[offset + 2] << 16)
+        | (patchBytes[offset + 3] << 24);
+
+      const validateDoomPatchBytes = (patchBytes) => {
+        if (!(patchBytes instanceof Uint8Array) || patchBytes.length < 8) {
+          return { ok: false, error: "Generated weapon patch buffer is too short" };
+        }
+
+        const width = readPatchUInt16(patchBytes, 0);
+        const height = readPatchUInt16(patchBytes, 2);
+        if (width <= 0 || height <= 0) {
+          return { ok: false, error: "Generated weapon patch has zero dimensions" };
+        }
+
+        const headerSize = 8 + width * 4;
+        if (headerSize > patchBytes.length) {
+          return { ok: false, error: "Generated weapon patch header exceeds buffer size" };
+        }
+
+        for (let column = 0; column < width; column += 1) {
+          const columnOffset = readPatchUInt32(patchBytes, 8 + column * 4) >>> 0;
+          if (columnOffset < headerSize || columnOffset >= patchBytes.length) {
+            return { ok: false, error: "Generated weapon patch column offset is outside buffer bounds" };
+          }
+
+          let cursor = columnOffset;
+          let guard = 0;
+          for (;;) {
+            if (cursor >= patchBytes.length) {
+              return { ok: false, error: "Generated weapon patch column stream is truncated" };
+            }
+
+            const topDelta = patchBytes[cursor];
+            if (topDelta === 0xff) {
+              break;
+            }
+
+            if (cursor + 3 >= patchBytes.length) {
+              return { ok: false, error: "Generated weapon patch post header is truncated" };
+            }
+
+            const length = patchBytes[cursor + 1];
+            if (length <= 0) {
+              return { ok: false, error: "Generated weapon patch post has zero length" };
+            }
+            if (topDelta + length > height) {
+              return { ok: false, error: "Generated weapon patch post exceeds patch height" };
+            }
+            if (cursor + 3 + length >= patchBytes.length) {
+              return { ok: false, error: "Generated weapon patch post data is truncated" };
+            }
+
+            cursor += 4 + length;
+            guard += 1;
+            if (guard > height + 1) {
+              return { ok: false, error: "Generated weapon patch column stream is malformed" };
+            }
+          }
+        }
+
+        return { ok: true };
+      };
+
+      const maybeCorruptPatchBytesForTest = (patchBytes) => {
+        if (!window.__doomTestCorruptNextWeaponPatch) {
+          return patchBytes;
+        }
+
+        window.__doomTestCorruptNextWeaponPatch = false;
+        const corrupted = patchBytes.slice();
+        if (corrupted.length >= 12) {
+          corrupted[8] = 0x00;
+          corrupted[9] = 0x00;
+          corrupted[10] = 0x00;
+          corrupted[11] = 0x00;
+        }
+        return corrupted;
+      };
+
+      const getRolePatchRoleNumber = (role) => {
+        return role === "attack" ? 1 : 2;
+      };
+
+      const buildReadyDerivedWeaponRoleCanvas = (
+        readyImage,
+        record,
+        role,
+        sharedAnchor
+      ) => {
+        return renderPreparedWeaponRoleImage(
+          readyImage,
+          record.target,
+          role,
+          sharedAnchor,
+          role === "flash"
+            ? {
+                synthesizeFlash: true,
+                brief: record.brief,
+                flashOrigin: sharedAnchor?.flashOrigin
+              }
+            : {
+                synthesizeAttack: true
+              }
+        );
+      };
+
+      const registerWeaponRoleCanvas = async (
+        weaponType,
+        role,
+        roleCanvas
+      ) => {
+        const rolePatchNumber = getRolePatchRoleNumber(role);
+        const roleBytes = await quantizeCanvasToPatch(roleCanvas, rolePatchNumber);
+        const roleValidation = validateDoomPatchBytes(roleBytes);
+        if (!roleValidation.ok) {
+          throw new Error(roleValidation.error);
+        }
+        const registered = registerNativeWeaponPatch(weaponType, rolePatchNumber, roleBytes);
+        if (!registered) {
+          throw new Error(`Failed to register ${role} weapon patch`);
+        }
+      };
+
+      const installNativeWeaponPatchSet = async (weaponType, handle) => {
+        const record = lookupRuntimeAssetRecord(handle);
+        const assetUrl = getRuntimeAssetUrl(record);
+        const bundle = getRuntimeWeaponBundle(record);
+        const readyRoleUrl = getRuntimeWeaponRoleUrl(record, "ready");
+        if (!record || !assetUrl) {
+          reportRuntimeAssetFailure(handle, "No image runtime asset record found for weapon swap");
+          clearNativeWeaponPatches(weaponType);
+          notifyWeaponSpriteReplacementReady(weaponType, false);
+          updateWeaponOverlayStatus({
+            manifestHandle: handle,
+            loadState: "error",
+            visible: false,
+            source: "",
+            pspriteSuppressed: false
+          });
+          return false;
+        }
+        if (typeof record.mediaType === "string" && !record.mediaType.startsWith("image/")) {
+          reportRuntimeAssetFailure(handle, "Weapon swap asset is not an image");
+          clearNativeWeaponPatches(weaponType);
+          notifyWeaponSpriteReplacementReady(weaponType, false);
+          updateWeaponOverlayStatus({
+            manifestHandle: handle,
+            loadState: "error",
+            visible: false,
+            source: assetUrl,
+            pspriteSuppressed: false
+          });
+          return false;
+        }
+
+        weaponOverlayState.manifestHandle = handle;
+        weaponOverlayState.imageUrl = readyRoleUrl || assetUrl;
+        weaponOverlayState.loaded = false;
+        weaponOverlayState.error = null;
+        weaponOverlayState.pendingLoadId += 1;
+        const loadId = weaponOverlayState.pendingLoadId;
+
+        updateWeaponOverlayStatus({
+          manifestHandle: handle,
+          loadState: "loading",
+          visible: false,
+          source: readyRoleUrl || assetUrl,
+          pspriteSuppressed: false
+        });
+
+        try {
+          const isBundleMode = Boolean(bundle && readyRoleUrl);
+          const readyImage = await loadImageElement(readyRoleUrl || assetUrl);
+          if (loadId !== weaponOverlayState.pendingLoadId) {
+            return false;
+          }
+          const readyRaster = rasterizeImage(readyImage);
+          const sharedAnchor = normalizeSharedAnchor(
+            bundle?.metadata,
+            readyRaster.sourceImage,
+            readyRaster.sourceCanvas.width,
+            readyRaster.sourceCanvas.height,
+            record.target
+          );
+          clearNativeWeaponPatches(weaponType);
+          const readyBytes = maybeCorruptPatchBytesForTest(
+            await quantizeCanvasToPatch(
+              renderPreparedWeaponRoleImage(readyImage, record.target, "ready", sharedAnchor),
+              0
+            )
+          );
+          const readyValidation = validateDoomPatchBytes(readyBytes);
+          if (!readyValidation.ok) {
+            throw new Error(readyValidation.error);
+          }
+          const readyRegistered = registerNativeWeaponPatch(weaponType, 0, readyBytes);
+          if (!readyRegistered) {
+            throw new Error(`Failed to register runtime ready weapon patch for ${handle}`);
+          }
+
+          if (isBundleMode) {
+            const optionalRoles = ["attack", "flash"];
+            for (const role of optionalRoles) {
+              const roleUrl = getRuntimeWeaponRoleUrl(record, role);
+              if (!roleUrl) {
+                const fallbackCanvas = buildReadyDerivedWeaponRoleCanvas(
+                  readyImage,
+                  record,
+                  role,
+                  sharedAnchor
+                );
+                await registerWeaponRoleCanvas(weaponType, role, fallbackCanvas);
+                recordAssetRuntimeLog(
+                  `Generated ${role} weapon role missing for ${handle}; using ready-derived fallback ${role} patch.`
+                );
+                continue;
+              }
+              try {
+                const roleImage = await loadImageElement(roleUrl);
+                if (loadId !== weaponOverlayState.pendingLoadId) {
+                  return false;
+                }
+                const roleRaster = rasterizeImage(roleImage);
+                const roleAlignment = evaluateWeaponRoleAnchorAlignment(roleRaster.sourceImage, sharedAnchor, role);
+                const rolePatchNumber = getRolePatchRoleNumber(role);
+                let roleCanvas = renderPreparedWeaponRoleImage(roleImage, record.target, role, sharedAnchor);
+                if (!roleAlignment.ok) {
+                  const roleFailureReason = [
+                    roleAlignment.metrics.anchorDriftPx ? "anchor drift" : null,
+                    roleAlignment.metrics.identityDrift ? "identity drift" : null
+                  ].filter(Boolean).join("/") || "alignment";
+                  recordAssetRuntimeLog(
+                    `Weapon ${role.toUpperCase()} role failed ${roleFailureReason} checks for ${handle}; fallback to ready-derived anchor-locked ${role} sprite.`
+                  );
+                  roleCanvas = renderPreparedWeaponRoleImage(
+                    readyImage,
+                    record.target,
+                    role,
+                    sharedAnchor,
+                    role === "flash"
+                      ? {
+                          synthesizeFlash: true,
+                          brief: record.brief,
+                          flashOrigin: sharedAnchor?.flashOrigin
+                        }
+                      : {
+                          synthesizeAttack: true
+                        }
+                  );
+                }
+                await registerWeaponRoleCanvas(weaponType, role, roleCanvas);
+              } catch (roleError) {
+                const message =
+                  roleError instanceof Error
+                    ? roleError.message
+                    : `Failed to build ${role} role for ${handle}`;
+                try {
+                  const fallbackCanvas = buildReadyDerivedWeaponRoleCanvas(
+                    readyImage,
+                    record,
+                    role,
+                    sharedAnchor
+                  );
+                  await registerWeaponRoleCanvas(weaponType, role, fallbackCanvas);
+                  recordAssetRuntimeLog(
+                    `Generated ${role} weapon role could not be installed for ${handle}; using ready-derived fallback ${role} patch. ${message}`
+                  );
+                } catch (fallbackError) {
+                  const fallbackMessage =
+                    fallbackError instanceof Error
+                      ? fallbackError.message
+                      : `Failed to synthesize fallback ${role} role for ${handle}`;
+                  recordAssetRuntimeLog(
+                    `Generated ${role} weapon role could not be installed for ${handle}; READY fallback only. ${message} ${fallbackMessage}`
+                  );
+                  reportRuntimeAssetFailure(
+                    handle,
+                    `Generated ${role} weapon role could not be installed; READY fallback only. ${message} ${fallbackMessage}`
+                  );
+                }
+              }
+            }
+          } else {
+            const attackBytes = await quantizeCanvasToPatch(
+              buildReadyDerivedWeaponRoleCanvas(readyImage, record, "attack", sharedAnchor),
+              1
+            );
+            const flashBytes = await quantizeCanvasToPatch(
+              buildReadyDerivedWeaponRoleCanvas(readyImage, record, "flash", sharedAnchor),
+              2
+            );
+            const attackValidation = validateDoomPatchBytes(attackBytes);
+            const flashValidation = validateDoomPatchBytes(flashBytes);
+
+            if (!attackValidation.ok) {
+              throw new Error(attackValidation.error);
+            }
+            if (!flashValidation.ok) {
+              throw new Error(flashValidation.error);
+            }
+
+            const attackRegistered = registerNativeWeaponPatch(weaponType, 1, attackBytes);
+            const flashRegistered = registerNativeWeaponPatch(weaponType, 2, flashBytes);
+            if (!attackRegistered || !flashRegistered) {
+              throw new Error(`Failed to register runtime weapon patches for ${handle}`);
+            }
+          }
+
+          weaponOverlayState.loaded = true;
+          notifyWeaponSpriteReplacementReady(weaponType, true);
+          hideWeaponOverlay();
+          updateWeaponOverlayStatus({
+            manifestHandle: handle,
+            loadState: "ready",
+            source: readyRoleUrl || assetUrl,
+            pspriteSuppressed: false
+          });
+          return true;
+        } catch (error) {
+          if (loadId !== weaponOverlayState.pendingLoadId) {
+            return false;
+          }
+          weaponOverlayState.loaded = false;
+          weaponOverlayState.error =
+            error instanceof Error ? error.message : `Failed to build runtime weapon patch for ${handle}`;
+          clearNativeWeaponPatches(weaponType);
+          notifyWeaponSpriteReplacementReady(weaponType, false);
+          reportRuntimeAssetFailure(handle, weaponOverlayState.error);
+          updateWeaponOverlayStatus({
+            manifestHandle: handle,
+            loadState: "error",
+            visible: false,
+            source: readyRoleUrl || assetUrl,
+            pspriteSuppressed: false
+          });
+          hideWeaponOverlay();
+          return false;
+        }
+      };
+
+      const installNativeEnemyPatchSet = async (enemyType, handle) => {
+        const record = lookupRuntimeAssetRecord(handle);
+        const assetUrl = getRuntimeAssetUrl(record);
+        const bundle = getRuntimeEnemyBundle(record);
+        if (!record || !assetUrl) {
+          reportRuntimeAssetFailure(handle, "No image runtime asset record found for enemy swap");
+          clearNativeEnemyPatch(enemyType);
+          updateEnemyReplacementStatus({
+            manifestHandle: handle,
+            loadState: "error",
+            visible: false,
+            source: "",
+            enemyType
+          });
+          return false;
+        }
+
+        if (typeof record.mediaType === "string" && !record.mediaType.startsWith("image/")) {
+          reportRuntimeAssetFailure(handle, "Enemy swap asset is not an image");
+          clearNativeEnemyPatch(enemyType);
+          updateEnemyReplacementStatus({
+            manifestHandle: handle,
+            loadState: "error",
+            visible: false,
+            source: assetUrl,
+            enemyType
+          });
+          return false;
+        }
+
+        updateEnemyReplacementStatus({
+          manifestHandle: handle,
+          loadState: "loading",
+          visible: false,
+          source: assetUrl,
+          enemyType
+        });
+
+        try {
+          clearNativeEnemyPatch(enemyType);
+          if (!bundle) {
+            const image = await loadImageElement(assetUrl);
+            const patchBytes = await quantizeCanvasToPatch(renderEnemyVariant(image), 0);
+            const validation = validateDoomPatchBytes(patchBytes);
+            if (!validation.ok) {
+              throw new Error(validation.error);
+            }
+
+            if (!registerNativeEnemyPatch(enemyType, patchBytes)) {
+              throw new Error(`Failed to register runtime enemy patch for ${handle}`);
+            }
+          } else {
+            const baseImage = await loadImageElement(assetUrl);
+            const baseRaster = rasterizeImage(baseImage);
+            const sharedEnemyAnchor = normalizeEnemySharedAnchor(
+              bundle?.metadata,
+              baseRaster.sourceImage,
+              baseRaster.sourceCanvas.width,
+              baseRaster.sourceCanvas.height
+            );
+            const requiredLiveStates = new Set(["idle_a", "idle_b", "run_a", "run_b", "run_c", "run_d", "attack_a", "attack_b", "pain_a"]);
+            const seenLiveStates = new Set();
+            const roleEntries = Object.entries(bundle.roles || {});
+            const roleWarnings = [];
+            let registeredRoleCount = 0;
+
+            for (const [roleKey, roleRecord] of roleEntries) {
+              if (!roleRecord || typeof roleRecord.assetUrl !== "string" || roleRecord.assetUrl.length === 0) {
+                continue;
+              }
+
+              const metadata = roleRecord.metadata || {};
+              const frameId = Number(metadata.frameId);
+              const stateRole = typeof metadata.stateRole === "string" ? metadata.stateRole : "";
+              const rotationName = typeof metadata.rotation === "string" ? metadata.rotation : "front";
+              if (!Number.isInteger(frameId) || frameId < 0 || frameId > 11) {
+                continue;
+              }
+
+              try {
+                const roleImage = await loadImageElement(roleRecord.assetUrl);
+                const roleCanvas = renderEnemyVariant(roleImage, sharedEnemyAnchor, stateRole);
+                const roleBytes = await quantizeCanvasToPatch(roleCanvas, 0, {
+                  leftOffsetOverride: Math.round(sharedEnemyAnchor?.centerline || roleCanvas.width / 2),
+                  topOffsetOverride: Math.round(sharedEnemyAnchor?.footAnchor?.y || roleCanvas.height)
+                });
+                const validation = validateDoomPatchBytes(roleBytes);
+                if (!validation.ok) {
+                  throw new Error(`${roleKey}: ${validation.error}`);
+                }
+
+                if (stateRole.startsWith("death_")) {
+                  for (let rotation = 0; rotation < 8; rotation += 1) {
+                    if (!registerNativeEnemyPatchRole(enemyType, frameId, rotation, roleBytes)) {
+                      throw new Error(`Failed to register death role ${roleKey} at rotation ${rotation}`);
+                    }
+                  }
+                  registeredRoleCount += 1;
+                  continue;
+                }
+
+                const rotationEntry = ENEMY_AUTHORED_ROTATION_MAP[rotationName];
+                if (!rotationEntry) {
+                  throw new Error(`Unknown enemy rotation metadata for ${roleKey}: ${rotationName}`);
+                }
+
+                if (!registerNativeEnemyPatchRole(enemyType, frameId, rotationEntry.rotation, roleBytes)) {
+                  throw new Error(`Failed to register enemy role ${roleKey}`);
+                }
+
+                if (Number.isInteger(rotationEntry.mirrorTarget)) {
+                  const mirroredCanvas = mirrorCanvasHorizontally(roleCanvas);
+                  const mirroredBytes = await quantizeCanvasToPatch(mirroredCanvas, 0, {
+                    leftOffsetOverride: Math.round(
+                      roleCanvas.width - (sharedEnemyAnchor?.centerline || roleCanvas.width / 2)
+                    ),
+                    topOffsetOverride: Math.round(sharedEnemyAnchor?.footAnchor?.y || mirroredCanvas.height)
+                  });
+                  const mirroredValidation = validateDoomPatchBytes(mirroredBytes);
+                  if (!mirroredValidation.ok) {
+                    throw new Error(`${roleKey}: ${mirroredValidation.error}`);
+                  }
+                  if (!registerNativeEnemyPatchRole(enemyType, frameId, rotationEntry.mirrorTarget, mirroredBytes)) {
+                    throw new Error(`Failed to register mirrored enemy role ${roleKey}`);
+                  }
+                }
+
+                if (stateRole) {
+                  seenLiveStates.add(stateRole);
+                }
+                registeredRoleCount += 1;
+              } catch (roleError) {
+                const message =
+                  roleError instanceof Error ? roleError.message : `Failed to register enemy role ${roleKey}`;
+                roleWarnings.push(message);
+                recordAssetRuntimeLog(
+                  `Generated enemy role could not be installed for ${handle}; keeping stock fallback for ${roleKey}. ${message}`
+                );
+              }
+            }
+
+            if (registeredRoleCount === 0) {
+              throw new Error(`Generated enemy bundle did not produce any valid runtime roles for ${handle}`);
+            }
+
+            const missingStates = Array.from(requiredLiveStates).filter((roleName) => !seenLiveStates.has(roleName));
+            const partialMessages = [];
+            if (roleWarnings.length > 0) {
+              partialMessages.push(
+                `${roleWarnings.length} generated enemy frame${roleWarnings.length === 1 ? "" : "s"} fell back to stock`
+              );
+            }
+            if (missingStates.length > 0) {
+              partialMessages.push(`missing required live states: ${missingStates.join(", ")}`);
+            }
+            if (partialMessages.length > 0) {
+              reportRuntimeAssetWarning(handle, partialMessages.join("; "));
+            }
+          }
+
+          updateEnemyReplacementStatus({
+            manifestHandle: handle,
+            loadState: "ready",
+            visible: true,
+            source: assetUrl,
+            enemyType
+          });
+          return true;
+        } catch (error) {
+          const message = error instanceof Error
+            ? error.message
+            : `Failed to build runtime enemy patch for ${handle}`;
+          clearNativeEnemyPatch(enemyType);
+          reportRuntimeAssetFailure(handle, message);
+          updateEnemyReplacementStatus({
+            manifestHandle: handle,
+            loadState: "error",
+            visible: false,
+            source: assetUrl,
+            enemyType
+          });
+          return false;
+        }
+      };
+
+      const installNativeHudPatchSet = async (_targetType, handle) => {
+        const record = lookupRuntimeAssetRecord(handle);
+        const bundle = getRuntimeHudBundle(record);
+        if (!record || !bundle) {
+          reportRuntimeAssetFailure(handle, "No HUD patch bundle found for HUD swap");
+          clearNativeHudFacePatches();
+          return false;
+        }
+
+        try {
+          clearNativeHudFacePatches();
+          for (const [roleKey, roleRecord] of Object.entries(bundle.roles || {})) {
+            if (!roleRecord || typeof roleRecord.assetUrl !== "string" || roleRecord.assetUrl.length === 0) {
+              continue;
+            }
+            const mappedSlots = Array.isArray(roleRecord.metadata?.mappedSlots)
+              ? roleRecord.metadata.mappedSlots.filter((value) => Number.isInteger(value))
+              : [];
+            if (mappedSlots.length === 0) {
+              continue;
+            }
+
+            const roleImage = await loadImageElement(roleRecord.assetUrl);
+            const patchBytes = await quantizeCanvasToPatch(renderImageCanvas(roleImage), 0);
+            const validation = validateDoomPatchBytes(patchBytes);
+            if (!validation.ok) {
+              throw new Error(`${roleKey}: ${validation.error}`);
+            }
+
+            for (const slot of mappedSlots) {
+              if (!registerNativeHudFacePatch(slot, patchBytes)) {
+                throw new Error(`Failed to register HUD face slot ${slot} for ${roleKey}`);
+              }
+            }
+          }
+          return true;
+        } catch (error) {
+          const message = error instanceof Error
+            ? error.message
+            : `Failed to build runtime HUD patch bundle for ${handle}`;
+          clearNativeHudFacePatches();
+          reportRuntimeAssetFailure(handle, message);
+          return false;
+        }
+      };
+
+      window.__doomModSetWeaponSpriteManifest = (weaponType, handle) => {
+        if (typeof weaponType !== "number" || weaponType < 0 || weaponType > 7) {
+          return false;
+        }
+
+        const normalizedHandle = typeof handle === "string" ? handle.trim() : "";
+        if (!normalizedHandle) {
+          clearNativeWeaponPatches(weaponType);
+          notifyWeaponSpriteReplacementReady(weaponType, false);
+          clearWeaponOverlay();
+          return true;
+        }
+
+        void installNativeWeaponPatchSet(weaponType, normalizedHandle);
+        return true;
+      };
+
+      window.__doomModSetEnemySpriteManifest = (enemyType, handle) => {
+        if (typeof enemyType !== "number" || enemyType < 0 || enemyType > 9) {
+          return false;
+        }
+
+        const normalizedHandle = typeof handle === "string" ? handle.trim() : "";
+        if (!normalizedHandle) {
+          clearNativeEnemyPatch(enemyType);
+          clearEnemyReplacement(enemyType);
+          return true;
+        }
+
+        void installNativeEnemyPatchSet(enemyType, normalizedHandle);
+        return true;
+      };
+
+      window.__doomModSetHudPatchManifest = (targetType, handle) => {
+        if (typeof targetType !== "number" || targetType !== 0) {
+          return false;
+        }
+
+        const normalizedHandle = typeof handle === "string" ? handle.trim() : "";
+        if (!normalizedHandle) {
+          clearNativeHudFacePatches();
+          return true;
+        }
+
+        void installNativeHudPatchSet(targetType, normalizedHandle);
+        return true;
+      };
+
+      const audioChannels = new Map();
+      const generatedSoundBuffers = new Map();
+      const generatedSoundLoads = new Map();
+      const builtinSfxBuffers = new Map();
+      let doomWadLoadPromise = null;
+      let doomWadDirectoryPromise = null;
+      let doomPalettePromise = null;
+
+      const updateWeaponSoundStatus = (updates) => {
+        window.__doomStandaloneState.weaponSound = {
+          ...(window.__doomStandaloneState.weaponSound || {}),
+          ...updates
+        };
+      };
+
+      const clearWeaponSoundPack = () => {
+        updateWeaponSoundStatus({
+          packHandle: "",
+          preloadState: "idle",
+          lastPlaySource: "none",
+          lastPlayedHandle: "",
+          source: "",
+          lastError: ""
+        });
+      };
+
+      const primeGeneratedSound = async (handle) => {
+        const normalizedHandle = typeof handle === "string" ? handle.trim() : "";
+        if (!normalizedHandle) {
+          clearWeaponSoundPack();
+          return true;
+        }
+
+        if (generatedSoundBuffers.has(normalizedHandle)) {
+          updateWeaponSoundStatus({
+            packHandle: normalizedHandle,
+            preloadState: "ready",
+            source: getRuntimeAssetUrl(lookupRuntimeAssetRecord(normalizedHandle)),
+            lastError: ""
+          });
+          return true;
+        }
+
+        if (generatedSoundLoads.has(normalizedHandle)) {
+          return generatedSoundLoads.get(normalizedHandle);
+        }
+
+        const record = lookupRuntimeAssetRecord(normalizedHandle);
+        const assetUrl = getRuntimeAssetUrl(record);
+        if (!record || !assetUrl) {
+          updateWeaponSoundStatus({
+            packHandle: normalizedHandle,
+            preloadState: "error",
+            source: "",
+            lastError: "No runtime asset record found for generated weapon sound"
+          });
+          reportRuntimeAssetFailure(
+            normalizedHandle,
+            "No runtime asset record found for generated weapon sound"
+          );
+          return false;
+        }
+
+        if (typeof record.mediaType === "string" && !record.mediaType.startsWith("audio/")) {
+          updateWeaponSoundStatus({
+            packHandle: normalizedHandle,
+            preloadState: "error",
+            source: assetUrl,
+            lastError: "Generated weapon sound asset is not audio"
+          });
+          reportRuntimeAssetFailure(normalizedHandle, "Generated weapon sound asset is not audio");
+          return false;
+        }
+
+        updateWeaponSoundStatus({
+          packHandle: normalizedHandle,
+          preloadState: "loading",
+          source: assetUrl,
+          lastError: ""
+        });
+
+        const loadPromise = (async () => {
+          try {
+            await unlockBrowserAudio();
+            const response = await fetch(assetUrl);
+            if (!response.ok) {
+              throw new Error(`Failed to fetch generated weapon sound (${response.status})`);
+            }
+            const audioBuffer = await response.arrayBuffer();
+            const decoded = await decodeAudioBuffer(audioBuffer);
+            generatedSoundBuffers.set(normalizedHandle, decoded);
+            updateWeaponSoundStatus({
+              packHandle: normalizedHandle,
+              preloadState: "ready",
+              source: assetUrl,
+              lastError: ""
+            });
+            return true;
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : "Failed to decode generated weapon sound";
+            updateWeaponSoundStatus({
+              packHandle: normalizedHandle,
+              preloadState: "error",
+              source: assetUrl,
+              lastError: message
+            });
+            reportRuntimeAssetFailure(normalizedHandle, message);
+            return false;
+          } finally {
+            generatedSoundLoads.delete(normalizedHandle);
+          }
+        })();
+
+        generatedSoundLoads.set(normalizedHandle, loadPromise);
+        return loadPromise;
+      };
+
+      const loadDoomWadBytes = async () => {
+        if (!doomWadLoadPromise) {
+          doomWadLoadPromise = fetch("doom1.wad").then(async (response) => {
+            if (!response.ok) {
+              throw new Error(`Failed to fetch doom1.wad (${response.status})`);
+            }
+            return response.arrayBuffer();
+          });
+        }
+        return doomWadLoadPromise;
+      };
+
+      const getDoomPalette = async () => {
+        if (!doomPalettePromise) {
+          doomPalettePromise = getDoomWadDirectory().then(({ buffer, directory }) => {
+            const entry = directory.get("PLAYPAL");
+            if (!entry || entry.size < 768) {
+              throw new Error("PLAYPAL was not found in doom1.wad");
+            }
+
+            const view = new Uint8Array(buffer, entry.filePos, 768);
+            const palette = [];
+            for (let index = 0; index < 256; index += 1) {
+              palette.push([view[index * 3], view[index * 3 + 1], view[index * 3 + 2]]);
+            }
+            return palette;
+          });
+        }
+
+        return doomPalettePromise;
+      };
+
+      const getDoomWadDirectory = async () => {
+        if (!doomWadDirectoryPromise) {
+          doomWadDirectoryPromise = loadDoomWadBytes().then((buffer) => {
+            const view = new DataView(buffer);
+            const wadType = String.fromCharCode(
+              view.getUint8(0),
+              view.getUint8(1),
+              view.getUint8(2),
+              view.getUint8(3)
+            );
+            if (wadType !== "IWAD" && wadType !== "PWAD") {
+              throw new Error(`Unexpected WAD header ${wadType}`);
+            }
+
+            const lumpCount = view.getInt32(4, true);
+            const directoryOffset = view.getInt32(8, true);
+            const directory = new Map();
+
+            for (let index = 0; index < lumpCount; index += 1) {
+              const entryOffset = directoryOffset + index * 16;
+              const filePos = view.getInt32(entryOffset, true);
+              const size = view.getInt32(entryOffset + 4, true);
+              let name = "";
+              for (let i = 0; i < 8; i += 1) {
+                const charCode = view.getUint8(entryOffset + 8 + i);
+                if (charCode === 0) {
+                  break;
+                }
+                name += String.fromCharCode(charCode);
+              }
+              directory.set(name.toUpperCase(), { filePos, size });
+            }
+
+            return { buffer, directory };
+          });
+        }
+
+        return doomWadDirectoryPromise;
+      };
+
+      const decodeBuiltinSfx = async (name) => {
+        const key = String(name || "").trim().toUpperCase();
+        if (!key) {
+          return null;
+        }
+        if (builtinSfxBuffers.has(key)) {
+          return builtinSfxBuffers.get(key);
+        }
+
+        const { buffer, directory } = await getDoomWadDirectory();
+        const lumpName = `DS${key}`.slice(0, 8);
+        const entry = directory.get(lumpName);
+        if (!entry) {
+          throw new Error(`Sound lump ${lumpName} was not found in doom1.wad`);
+        }
+
+        const view = new DataView(buffer, entry.filePos, entry.size);
+        if (entry.size < 24 || view.getUint8(0) !== 0x03 || view.getUint8(1) !== 0x00) {
+          throw new Error(`Sound lump ${lumpName} is not a valid Doom DMX sound`);
+        }
+
+        const sampleRate = view.getUint16(2, true);
+        const declaredLength = view.getUint32(4, true);
+        const sampleOffset = 24;
+        const sampleLength = declaredLength - 32;
+
+        if (declaredLength <= 48 || sampleOffset + sampleLength > entry.size) {
+          throw new Error(`Sound lump ${lumpName} has invalid sample bounds`);
+        }
+
+        const audioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!audioContextCtor) {
+          throw new Error("Browser AudioContext is unavailable");
+        }
+        if (!browserAudioState.context) {
+          browserAudioState.context = new audioContextCtor();
+        }
+
+        const audioBuffer = browserAudioState.context.createBuffer(1, sampleLength, sampleRate);
+        const channel = audioBuffer.getChannelData(0);
+        for (let i = 0; i < sampleLength; i += 1) {
+          const value = view.getUint8(sampleOffset + i);
+          channel[i] = (value - 128) / 128;
+        }
+
+        builtinSfxBuffers.set(key, audioBuffer);
+        return audioBuffer;
+      };
+
+      const playBuiltinSfx = async (name, volume = 127, sep = 128) => {
+        await unlockBrowserAudio();
+        const audioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!audioContextCtor) {
+          throw new Error("Browser AudioContext is unavailable");
+        }
+        if (!browserAudioState.context) {
+          browserAudioState.context = new audioContextCtor();
+        }
+
+        const buffer = await decodeBuiltinSfx(name);
+        if (!buffer) {
+          return false;
+        }
+
+        const source = browserAudioState.context.createBufferSource();
+        source.buffer = buffer;
+
+        const gainNode = browserAudioState.context.createGain();
+        gainNode.gain.value = Math.max(0, Math.min(1, Number(volume) / 127));
+
+        let finalNode = gainNode;
+        if (typeof browserAudioState.context.createStereoPanner === "function") {
+          const panner = browserAudioState.context.createStereoPanner();
+          panner.pan.value = Math.max(-1, Math.min(1, (Number(sep) - 127) / 127));
+          gainNode.connect(panner);
+          panner.connect(browserAudioState.context.destination);
+          finalNode = panner;
+        } else {
+          gainNode.connect(browserAudioState.context.destination);
+        }
+
+        source.connect(gainNode);
+        source.start(0);
+        updateWeaponSoundStatus({
+          lastPlaySource: "stock",
+          lastPlayedHandle: String(name || ""),
+          lastError: ""
+        });
+        source.addEventListener(
+          "ended",
+          () => {
+            source.disconnect();
+            gainNode.disconnect();
+            if (finalNode !== gainNode) {
+              finalNode.disconnect();
+            }
+          },
+          { once: true }
+        );
+
+        return true;
+      };
+
+      window.__doomModSetWeaponSoundPack = (weaponType, handle) => {
+        if (typeof weaponType !== "number" || weaponType < 0 || weaponType > 7) {
+          return false;
+        }
+
+        const normalizedHandle = typeof handle === "string" ? handle.trim() : "";
+        if (!normalizedHandle) {
+          clearWeaponSoundPack();
+          return true;
+        }
+
+        updateWeaponSoundStatus({
+          packHandle: normalizedHandle,
+          preloadState: "loading",
+          source: getRuntimeAssetUrl(lookupRuntimeAssetRecord(normalizedHandle)),
+          lastError: ""
+        });
+        void primeGeneratedSound(normalizedHandle);
+        return true;
+      };
+
+      window.__doomModPlayBuiltinSfx = (name, volume, sep) => {
+        if (typeof name !== "string" || name.trim().length === 0) {
+          return false;
+        }
+        void playBuiltinSfx(name, volume, sep).catch((error) => {
+          recordAssetRuntimeError(
+            `Built-in SFX playback failed for ${name}: ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+        return true;
+      };
+
+      window.__doomModPlayAssetSound = (handle) => {
+        const record = lookupRuntimeAssetRecord(handle);
+        const assetUrl = getRuntimeAssetUrl(record);
+        if (!record || !assetUrl) {
+          reportRuntimeAssetFailure(handle, "No runtime asset record found for generated sound");
+          return false;
+        }
+
+        if (!generatedSoundBuffers.has(handle)) {
+          const loadState = window.__doomStandaloneState.weaponSound?.preloadState;
+          if (loadState !== "loading") {
+            void primeGeneratedSound(handle);
+          }
+          return false;
+        }
+
+        try {
+          const buffer = generatedSoundBuffers.get(handle);
+          const audioContextCtor = window.AudioContext || window.webkitAudioContext;
+          if (!audioContextCtor) {
+            throw new Error("Browser AudioContext is unavailable");
+          }
+          if (!browserAudioState.context) {
+            browserAudioState.context = new audioContextCtor();
+          }
+          const source = browserAudioState.context.createBufferSource();
+          const gainNode = browserAudioState.context.createGain();
+          source.buffer = buffer;
+          gainNode.gain.value = 0.9;
+          source.connect(gainNode);
+          gainNode.connect(browserAudioState.context.destination);
+          source.start(0);
+          audioChannels.set(handle, source);
+          updateWeaponSoundStatus({
+            lastPlaySource: "generated",
+            lastPlayedHandle: handle,
+            source: assetUrl,
+            lastError: ""
+          });
+          source.addEventListener(
+            "ended",
+            () => {
+              audioChannels.delete(handle);
+              source.disconnect();
+              gainNode.disconnect();
+            },
+            { once: true }
+          );
+          return true;
+        } catch (error) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : `Browser rejected generated asset playback for handle ${handle}`;
+          updateWeaponSoundStatus({
+            lastError: message
+          });
+          reportRuntimeAssetFailure(handle, message);
+          return false;
+        }
+      };
+
+      registerAudioUnlock();
+
+      var Module = {
+        noInitialRun: true,
+        preRun: () => {
+          Module.FS.createPreloadedFile("", "doom1.wad", "/doom/doom1.wad", true, true);
+          Module.FS.createPreloadedFile("", "default.cfg", "/doom-wasm/default.cfg", true, true);
+        },
+        onRuntimeInitialized: () => {
+          console.info("[doom-shell] onRuntimeInitialized hook entered");
+          window.__doomStandaloneState.runtimeInitialized = true;
+          if (window.__doomStandaloneState.bootRequested) {
+            startDoomMain();
+          } else {
+            setStatus("Runtime ready", true);
+          }
+        },
+        postRun: () => {
+          console.info("[doom-shell] postRun hook entered");
+        },
+        print: (...args) => console.log("[doom-shell]", ...args),
+        printErr: (...args) => {
+          const message = args.map(String).join(" ");
+          if (
+            !window.__doomStandaloneState.bootError &&
+            /recursive call to I_Error|program exited|Aborted|memory access out of bounds|alignment fault|Bad music number|emscripten_force_exit cannot actually shut down/i.test(
+              message
+            )
+          ) {
+            recordBootError(message);
+          }
+          console.error("[doom-shell]", ...args);
+        },
+        setStatus,
+        canvas: canvasElement,
+        monitorRunDependencies: (left) => {
+          if (left > 0) {
+            setStatus(`Preparing ${left}`);
+          }
+        }
+      };
+
+      window.addEventListener("error", (event) => {
+        const message = event.error instanceof Error ? event.error.message : String(event.message);
+        recordBootError(message);
+        setStatus("Boot error");
+        console.error("[doom-shell] window error", event.error ?? event.message);
+      });
+      window.addEventListener("unhandledrejection", (event) => {
+        const reason = event.reason instanceof Error ? event.reason.message : String(event.reason);
+        recordBootError(reason);
+        setStatus("Runtime error", true);
+        console.error("[doom-shell] unhandled rejection", event.reason);
+      });
+    </script>
+    <script
+      src="websockets-doom.js"
+      onload="window.__doomStandaloneState.scriptLoaded = true; setStatus('WASM loader ready');"
+      onerror="window.__doomStandaloneState.bootError = 'Failed to load websockets-doom.js'; setStatus('Loader failed');"
+    ></script>
+  </body>
+</html>
