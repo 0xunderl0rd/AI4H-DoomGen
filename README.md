@@ -1,6 +1,6 @@
 # DoomGen
 
-DoomGen is a browser-first DOOM mod prototyping app that turns plain-language prompts into live runtime swaps, generated art, and generated audio.
+DoomGen is a prompt-driven DOOM mod prototyping app for cloud and local model workflows. It turns plain-language prompts into live runtime swaps, generated art, and generated audio.
 
 The current app supports three provider modes:
 
@@ -14,6 +14,12 @@ The runtime loop is:
 2. Plan validation/clamping against allowlisted mutation primitives
 3. Immediate runtime mutations on tic boundaries
 4. Asynchronous asset generation + hot-swap
+
+## Fastest Path
+
+- Want the least setup: use `cloud`
+- Want local visual generation: use `local`
+- Want local visuals with cloud-backed audio: use `hybrid`
 
 ## Current Scope
 
