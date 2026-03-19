@@ -2,6 +2,8 @@
 
 DoomGen is a prompt-driven DOOM mod prototyping app for cloud and local model workflows. It turns plain-language prompts into live runtime swaps, generated art, and generated audio.
 
+![DoomGen title art](docs/assets/title-art.jpg)
+
 The current app supports three provider modes:
 
 - `cloud`: OpenAI planner + OpenAI image/HUD generation + ElevenLabs audio
@@ -35,6 +37,10 @@ Local service scope is intentionally narrower than the frontend abstraction:
 - local service handles planning plus local visual asset generation
 - sound requests still route through the provider-backed audio path
 - Doom WASM runtime is supported when assets are built and enabled
+
+## In Action
+
+![DoomGen gameplay screenshot](docs/assets/in-game-screenshot.png)
 
 ## Quick Start
 
